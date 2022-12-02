@@ -18,81 +18,304 @@
 // Also, The input struct must be passed by its address, otherwise the values
 // of its fields cannot be changed.
 //
-// Example
+// Example:
 //
-//    T := testScrub{
-//       Username: "administrator",
-//       Password: "my_secret_passphrase",
-//       Codes:    []string{"pass1", "pass2", "pass3"},
-//    }
+//		import "github.com/sumup/go-scrub"
 //
-//    fieldsToScrub := map[string]bool{"password": true, "codes": true}
+//		// Have a struct with some sensitive fields.
+//		type testScrub struct {
+//			Username string
+//			Password string
+//			Codes    []string
+//		}
 //
-//    out := Scrub(&T, fieldsToScrub)
-//    log.Println(out)
-//    OUTPUT: {username:administrator Password:******** Codes:[******** ******** ********]}
+//		type fieldScrubOpts struct {
+//			maskingSymbol string
+//			partScrubConf *PartScrubConf
+//		}
+//
+//		func newFieldScrubOpts(
+//			maskingSymbol string,
+//			partScrubConf *PartScrubConf,
+//		) *fieldScrubOpts {
+//			return &fieldScrubOpts{
+//				maskingSymbol,
+//				partScrubConf,
+//			}
+//		}
+//
+//		func (f *fieldScrubOpts) GetMaskingSymbol() string {
+//			return f.maskingSymbol
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskEnabled() bool {
+//			if f.partScrubConf == nil {
+//				return false
+//			}
+//
+//			return f.partScrubConf.PartMaskEnabled
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskMinFldLen() int {
+//			if f.partScrubConf == nil {
+//				return 0
+//			}
+//
+//			return f.partScrubConf.PartMaskMinFldLen
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskMaxFldLen() int {
+//			if f.partScrubConf == nil {
+//				return 0
+//			}
+//
+//			return f.partScrubConf.PartMaskMaxFldLen
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskVisibleFrontLen() int {
+//			if f.partScrubConf == nil {
+//				return 0
+//			}
+//
+//			return f.partScrubConf.VisibleFrontLen
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskVisibleBackOnlyIfFldLenGreaterThan() int {
+//			if f.partScrubConf == nil {
+//				return 0
+//			}
+//
+//			return f.partScrubConf.VisibleBackOnlyIfFldLenGreaterThan
+//		}
+//
+//		func (f *fieldScrubOpts) PartMaskVisibleBackLen() int {
+//			if f.partScrubConf == nil {
+//				return 0
+//			}
+//
+//			return f.partScrubConf.VisibleBackLen
+//		}
+//
+//		// Create a struct with some sensitive data.
+//		T := &testScrub{
+//			Username: "administrator",
+//			Password: "my_secret_passphrase",
+//			Codes:    []string{"pass1", "pass2", "pass3"},
+//		}
+//
+//		// Create empty instance of testScrub
+//		emptyT := &testScrub{}
+//
+//		// Create a set of field names to scrub (default is 'password').
+//		fieldsToScrub := map[string]FieldScrubOptioner{
+//			"password":  newFieldScrubOpts("*", nil),
+//			"codes":      newFieldScrubOpts(".", nil),
+//		}
+//
+//		scrub.MaskLenVary = true
+//
+//		// Call the util API to get a JSON formatted string with scrubbed field values.
+//		out := scrub.Scrub(emptyT, T, fieldsToScrub, scrub.JSONScrub)
+//
+//		// Log the scrubbed string without worrying about prying eyes!
+//		log.Println(out)
+//		// OUTPUT: {username:administrator Password:******************** Codes:[..... ..... .....]}
+//
+//		// NOTE: Please reffer to `scrub_test.go` for all supported scenarios
 package scrub
 
 import (
 	"encoding/json"
+	"encoding/xml"
+	"fmt"
 	"reflect"
 	"strings"
 )
 
-// DefaultToScrub contains default field names to scrub.
-// NOTE: these fields should be all lowercase. Comparison is case insensitive.
-var DefaultToScrub = map[string]bool{
-	"password": true,
+// DataType specifies supported formats
+type DataType string
+
+const (
+	// XMLScrub - support of xml format
+	XMLScrub DataType = "xml"
+	// JSONScrub - support of json format
+	JSONScrub DataType = "json"
+	// defaultMaskLen specifies default mask length
+	defaultMaskLen int = 8
+	// defaultMaskSymbol specifies default mask symbol
+	defaultMaskSymbol string = "*"
+)
+
+var (
+	// defaultToScrub contains default field names to scrub.
+	// NOTE: these fields should be all lowercase. Comparison is case insensitive.
+	defaultToScrub map[string]FieldScrubOptioner = map[string]FieldScrubOptioner{
+		"password": &defaultFieldScrubOpts{},
+	}
+	// MaskLenVary specifies mask length equals DefaultMaskLen or mask length equals to value length
+	MaskLenVary bool = false
+)
+
+// FieldScrubOptioner provides an interface for custom masking field options
+type FieldScrubOptioner interface {
+	GetMaskingSymbol() string
+	PartMaskEnabled() bool
+	PartMaskMinFldLen() int
+	PartMaskMaxFldLen() int
+	PartMaskVisibleFrontLen() int
+	PartMaskVisibleBackOnlyIfFldLenGreaterThan() int
+	PartMaskVisibleBackLen() int
 }
 
-// Scrub scrubs all the specified string fields in the 'input' struct
-// at any level recursively and returns a JSON-formatted string of the
-// scrubbed struct.
-func Scrub(input interface{}, fieldsToScrub map[string]bool) string {
-	if input == nil {
-		// Return json representation of 'nil' input
+type defaultFieldScrubOpts struct{}
+
+func (dfo *defaultFieldScrubOpts) GetMaskingSymbol() string {
+	return defaultMaskSymbol
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskEnabled() bool {
+	return false
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskMinFldLen() int {
+	return 0
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskMaxFldLen() int {
+	return 0
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskVisibleFrontLen() int {
+	return 0
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskVisibleBackOnlyIfFldLenGreaterThan() int {
+	return 0
+}
+
+func (dfo *defaultFieldScrubOpts) PartMaskVisibleBackLen() int {
+	return 0
+}
+
+// PartScrubConf provides options for partitial field masking
+type PartScrubConf struct {
+	PartMaskEnabled                    bool
+	PartMaskMinFldLen                  int
+	PartMaskMaxFldLen                  int
+	VisibleFrontLen                    int
+	VisibleBackOnlyIfFldLenGreaterThan int
+	VisibleBackLen                     int
+}
+
+// NewPartScrubConf is PartScrubConf constructor
+func NewPartScrubConf(
+	partMaskEnabled bool,
+	partMaskMinFldLen int,
+	partMaskMaxFldLen int,
+	visibleFrontLen int,
+	visibleBackOnlyIfFldLenGreaterThan int,
+	visibleBackLen int,
+) *PartScrubConf {
+	return &PartScrubConf{
+		partMaskEnabled,
+		partMaskMinFldLen,
+		partMaskMaxFldLen,
+		visibleFrontLen,
+		visibleBackOnlyIfFldLenGreaterThan,
+		visibleBackLen,
+	}
+}
+
+// Scrub scrubs all the specified string fields in the 'target' struct
+// at any level recursively and returns a DataType formatted string of the scrubbed struct.
+//
+// A pointer to a new empty instance of the 'target' struct is needed
+// to act as a 'cloning' of the 'target' to avoid race conditions
+func Scrub(cloning interface{}, target interface{}, fieldsToScrub map[string]FieldScrubOptioner, dataType DataType) string {
+	if invalidInput(cloning, target) {
+		switch dataType {
+		case JSONScrub:
+			// Return json representation of 'nil' input
+			return "null"
+		case XMLScrub:
+			// Return xml representation of 'nil' input
+			return ""
+		default:
+			// Return json representation of 'nil' input
+			return "null"
+		}
+	}
+
+	// Clone target struct to avoid race conditions
+	switch dataType {
+	case JSONScrub:
+		b, err := json.Marshal(target)
+
+		if err != nil {
+			return "null"
+		}
+
+		if err = json.Unmarshal(b, cloning); err != nil {
+			return "null"
+		}
+
+	case XMLScrub:
+		b, err := xml.MarshalIndent(target, "  ", "    ")
+
+		if err != nil {
+			return ""
+		}
+
+		if err = xml.Unmarshal(b, cloning); err != nil {
+			return ""
+		}
+
+	default:
 		return "null"
 	}
 
+	// Set default fields to scrub
 	if fieldsToScrub == nil {
-		fieldsToScrub = DefaultToScrub
+		fieldsToScrub = defaultToScrub
 	}
 
 	// Call a recursive function to find and scrub fields in input at any level.
-	savedValues := make([]string, 0)
-	scrubInternal(input, "", fieldsToScrub, &savedValues, true /* mask */)
+	scrubInternal(cloning, "", fieldsToScrub)
 
-	// Get a JSON marshalled string from the scrubb string to return.
-	var b []byte
-	b, _ = json.Marshal(input)
+	// Get the marshalled string from the scrubb string and return the scrubbed string.
+	switch dataType {
+	case JSONScrub:
+		b, err := json.Marshal(cloning)
 
-	// Restore all the scrubbed values back to the original values in the struct.
-	scrubInternal(input, "", fieldsToScrub, &savedValues, false /* unmask */)
+		if err != nil {
+			return "null"
+		}
 
-	// Return the scrubbed string
-	return string(b)
+		return string(b)
+	case XMLScrub:
+		b, err := xml.MarshalIndent(cloning, "  ", "    ")
+
+		if err != nil {
+			return ""
+		}
+
+		return string(b)
+	default:
+		return ""
+	}
 }
 
-// scrubInternal scrubs all the specified string fields in the 'input' struct
-// at any level recursively and returns a JSON formatted string of the scrubbed struct.
-// It restores the struct back to the original values before returning.
+// scrubInternal scrubs all the specified string fields and map fields of type map[string]interface{}
+// in the 'target' struct at any level recursively and returns a DataType formatted string of the
+// scrubbed struct.
 //
 // It loops over the given 'target' struct recursively, looking for 'string'
-// field names specified in 'fieldsToScrub'. If found, it saves the value in
-// 'savedValues' and scrubs the value with '********'.
-// If 'mask' is set to false, then it reverses the operation by replacing all masked
-// fields with the original value saved in 'savedValues'.
-//
-// A typical usage is to call this API with an empty 'savedValues' with 'mask' as true to
-// scrub all sensitive values in the struct. Afterwards, call it back with the filled
-// 'savedValues' with 'mask' as false to restore the original struct.
-//
-// NOTE: 'savedValues' must be preserved by the caller to restore the original struct
-// and must not be modified.
+// field names and keys in maps of type map[string]interface{} specified in 'fieldsToScrub'.
+// If found, it scrubs the value with the given symbol defined in 'fieldsToScrub'
+// Depending on the MaskLenVary option scrub length can be fixed or vary.
 //
 // This is an internal API. It should not be used directly by any caller.
-func scrubInternal(target interface{}, fieldName string, fieldsToScrub map[string]bool,
-	savedValues *[]string, mask bool) {
+func scrubInternal(target interface{}, fieldName string, fieldsToScrub map[string]FieldScrubOptioner) {
 
 	// if target is not pointer, then immediately return
 	// modifying struct's field requires addressable object
@@ -141,8 +364,7 @@ func scrubInternal(target interface{}, fieldName string, fieldsToScrub map[strin
 				continue
 			}
 
-			scrubInternal(fValue.Addr().Interface(), fType.Name, fieldsToScrub,
-				savedValues, mask)
+			scrubInternal(fValue.Addr().Interface(), fType.Name, fieldsToScrub)
 		}
 		return
 	}
@@ -168,9 +390,15 @@ func scrubInternal(target interface{}, fieldName string, fieldsToScrub map[strin
 				continue
 			}
 
-			scrubInternal(arrValue.Addr().Interface(), fieldName, fieldsToScrub,
-				savedValues, mask)
+			scrubInternal(arrValue.Addr().Interface(), fieldName, fieldsToScrub)
 		}
+
+		return
+	}
+
+	if targetType.Kind() == reflect.Map {
+		// If target is a map, then recurse on each of its keys.
+		scrubInternalMap(targetValue, fieldsToScrub)
 
 		return
 	}
@@ -182,18 +410,110 @@ func scrubInternal(target interface{}, fieldName string, fieldsToScrub map[strin
 		return
 	}
 
-	if _, ok := fieldsToScrub[strings.ToLower(fieldName)]; ok {
-		// Scrub this string value. Other types are not scrubbed.
-		if targetValue.CanSet() && targetValue.Kind() == reflect.String && !targetValue.IsZero() {
-			if mask {
-				// Save the value, so that it can be restored later.
-				*savedValues = append(*savedValues, targetValue.String())
-				targetValue.SetString("********")
-			} else {
-				// Restore from the saved value.
-				targetValue.SetString((*savedValues)[0])
-				*savedValues = (*savedValues)[1:]
+	if mask, ok := doMasking(targetValue, fieldName, fieldsToScrub, true); ok {
+		targetValue.SetString(mask)
+	}
+}
+
+// scrubInternalMap iterate recursively over maps and scrubs the value with the given symbol
+// defined in 'fieldsToScrub'
+// NOTE: Currently only string values in maps of type map[string]interface{} are scrubbed
+func scrubInternalMap(targetMap reflect.Value, fieldsToScrub map[string]FieldScrubOptioner) reflect.Value {
+	for _, k := range targetMap.MapKeys() {
+		v := targetMap.MapIndex(k)
+
+		if v.Type().Kind() != reflect.Interface {
+			continue
+		}
+
+		if v.Elem().Kind() == reflect.String {
+			if mask, ok := doMasking(v.Elem(), k.String(), fieldsToScrub, false); ok {
+				targetMap.SetMapIndex(reflect.ValueOf(k.String()), reflect.ValueOf(mask))
+			}
+		}
+
+		if v.Elem().Kind() == reflect.Array || v.Elem().Kind() == reflect.Slice {
+			for i := 0; i < v.Elem().Len(); i++ {
+				arrValue := v.Elem().Index(i)
+
+				if arrValue.Elem().Kind() == reflect.Map {
+					scrubInternalMap(arrValue.Elem(), fieldsToScrub)
+				}
 			}
 		}
 	}
+
+	return targetMap
+}
+
+// doMasking does the real masking of the string values
+func doMasking(targetValue reflect.Value, fieldName string, fieldsToScrub map[string]FieldScrubOptioner, checkCanSet bool) (string, bool) {
+	if opts, ok := fieldsToScrub[strings.ToLower(fieldName)]; ok {
+
+		// Check if value can be changed depending of the use case
+		if checkCanSet && !targetValue.CanSet() {
+			return "", false
+		}
+
+		// Scrub this string value. Other types are not scrubbed.
+		if targetValue.Kind() == reflect.String && !targetValue.IsZero() {
+			var symbol string
+
+			if opts != nil && len(opts.GetMaskingSymbol()) == 1 {
+				symbol = opts.GetMaskingSymbol()
+			} else {
+				// Fallback to default symbol *
+				symbol = defaultMaskSymbol
+			}
+
+			if opts != nil && opts.PartMaskEnabled() {
+				switch {
+				case targetValue.Len() < opts.PartMaskMinFldLen():
+					return applyFullMask(symbol, maskLen(targetValue.Len())), ok
+				case targetValue.Len() > opts.PartMaskMaxFldLen():
+					return applyFullMask(symbol, maskLen(targetValue.Len())), ok
+				case targetValue.Len() < opts.PartMaskVisibleBackOnlyIfFldLenGreaterThan():
+					return applyPartBackMask(targetValue.String(), symbol, opts.PartMaskVisibleFrontLen()), ok
+				case targetValue.Len() <= opts.PartMaskMaxFldLen():
+					return applyPartMiddleMask(targetValue.String(), symbol, opts.PartMaskVisibleFrontLen(), opts.PartMaskVisibleBackLen()), ok
+				}
+			}
+
+			return applyFullMask(symbol, maskLen(targetValue.Len())), ok
+		}
+	}
+
+	return "", false
+}
+
+func maskLen(targetValueLen int) int {
+	if MaskLenVary {
+		return targetValueLen
+	}
+
+	return defaultMaskLen
+}
+
+func applyPartBackMask(value string, symbol string, visibleFrontLen int) string {
+	visibleFront := value[0:visibleFrontLen]
+	maskedBack := strings.Repeat(symbol, len(value)-visibleFrontLen)
+
+	return fmt.Sprintf("%s%s", visibleFront, maskedBack)
+}
+
+func applyPartMiddleMask(value string, symbol string, visibleFrontLen int, visibleBackLen int) string {
+	visibleFront := value[0:visibleFrontLen]
+	visibleBack := value[len(value)-visibleBackLen:]
+	maskedMiddle := strings.Repeat(symbol, (len(value)-visibleFrontLen)-visibleBackLen)
+
+	return fmt.Sprintf("%s%s%s", visibleFront, maskedMiddle, visibleBack)
+}
+
+func applyFullMask(symbol string, maskLen int) string {
+	return strings.Repeat(symbol, maskLen)
+}
+
+// Validate target pointers
+func invalidInput(cloning interface{}, target interface{}) bool {
+	return cloning == nil || target == nil || reflect.ValueOf(cloning).IsZero() || reflect.ValueOf(target).IsZero()
 }
